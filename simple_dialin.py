@@ -8,6 +8,8 @@ import asyncio
 import os
 import sys
 
+from typing import Optional
+
 from call_connection_manager import CallConfigManager, SessionManager
 from dotenv import load_dotenv
 from loguru import logger
@@ -23,8 +25,16 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.google.llm import GoogleLLMService
 from pipecat.transports.services.daily import DailyDialinSettings, DailyParams, DailyTransport
+
+
+from pipecat.processors.user_idle_processor import UserIdleProcessor
+from pipecat.frames.frames import TTSSpeakFrame, EndFrame
+
+
+import datetime
+
 
 load_dotenv(override=True)
 
@@ -34,12 +44,101 @@ logger.add(sys.stderr, level="DEBUG")
 daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
+# --- Post-Call Logging State Variables ---
+_call_start_time: Optional[datetime.datetime] = None
+_silence_event_count: int = 0
+MAX_SILENCE_PROMPTS: int = 3
+_summary_logged_flag: bool = False
+_active_pipeline_task: Optional[PipelineTask] = None
+
+
+# --- Logging Function ---
+def log_call_summary(termination_reason: str, call_id_info: str = "N/A"):
+    global _call_start_time, _silence_event_count, _summary_logged_flag
+    if _summary_logged_flag:
+        logger.info("Call summary already logged for this session.")
+        return
+
+    logger.info("Attempting to log call summary.")
+    if _call_start_time:
+        call_end_time = datetime.datetime.now()
+        duration = call_end_time - _call_start_time
+        logger.info(f"--- Post-Call Summary (Call ID/Info: {call_id_info}) ---")
+        logger.info(f"Termination Reason: {termination_reason}")
+        logger.info(f"Call Start Time: {_call_start_time.isoformat()}")
+        logger.info(f"Call End Time: {call_end_time.isoformat()}")
+        logger.info(f"Call Duration: {str(duration)}")
+        logger.info(f"Silence Events Detected (10s+): {_silence_event_count}")
+        logger.info(f"----------------------------------------------------")
+    else:
+        logger.warning(f"Call start time not recorded for Call ID/Info: {call_id_info}, cannot log full duration summary.")
+        logger.info(f"--- Post-Call Summary (Partial) (Call ID/Info: {call_id_info}) ---")
+        logger.info(f"Termination Reason: {termination_reason}")
+        logger.info(f"Silence Events Detected (10s+): {_silence_event_count}")
+        logger.info(f"-------------------------------------------------------------")
+    _summary_logged_flag = True
+    
+async def handle_user_idle(processor: UserIdleProcessor, retry_count: int):
+    """Handle user inactivity by sending reminders and eventually ending the call."""
+    global _silence_event_count, _active_pipeline_task 
+    _silence_event_count += 1
+    logger.info(f"User idle detected. Retry count: {retry_count}, Total silence events for this call: {_silence_event_count}")
+
+    prompt_message = ""
+    final_goodbye_message = False
+    if retry_count == 1:
+        prompt_message = "Are you still there?"
+    elif retry_count == 2:
+        prompt_message = "It seems you're not responding. Would you like to continue our conversation?"
+    elif retry_count >= MAX_SILENCE_PROMPTS: 
+        prompt_message = "I haven't heard from you in a while. I'll disconnect the call now. Goodbye!"
+        final_goodbye_message = True
+
+    if prompt_message:
+        logger.info(f"Sending TTS prompt: '{prompt_message}'")
+        try:
+            await processor.push_frame(TTSSpeakFrame(prompt_message))
+            logger.debug(f"Successfully pushed TTSSpeakFrame for: '{prompt_message}'")
+        except Exception as e:
+            logger.error(f"Error pushing TTSSpeakFrame for '{prompt_message}': {e}", exc_info=True)
+       
+            if final_goodbye_message:
+                logger.warning("Proceeding to push EndFrame despite TTS error for final goodbye.")
+            else:
+                return True 
+
+    if final_goodbye_message: 
+        logger.info("Max silence prompts reached. Initiating call termination sequence.")
+        
+
+        logger.info("Pushing EndFrame UPSTREAM to terminate pipeline.")
+        try:
+            await processor.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+            logger.debug("Successfully pushed EndFrame.")
+        except Exception as e:
+            logger.error(f"Error pushing EndFrame: {e}", exc_info=True)
+           
+        return False  # Stop monitoring
+    
+    return True  # Continue monitoring
 
 async def main(
     room_url: str,
     token: str,
     body: dict,
 ):
+    
+    global _call_start_time, _silence_event_count, _summary_logged_flag, _active_pipeline_task
+    
+    # Reset state variables for each call
+    _call_start_time = None
+    _silence_event_count = 0
+    _summary_logged_flag = False
+    _active_pipeline_task = None
+    
+    call_id_for_logs = "N/A" # Placeholder for a call identifier
+    
+    
     # ------------ CONFIGURATION AND SETUP ------------
 
     # Create a config manager using the provided body
@@ -125,7 +224,12 @@ async def main(
     system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. If the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function. """
 
     # Initialize LLM
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = GoogleLLMService(
+        model="models/gemini-2.0-flash-lite",
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        system_instruction=system_instruction,
+        tools=tools,
+    )
 
     # Register functions with the LLM
     llm.register_function("terminate_call", terminate_call)
@@ -139,10 +243,18 @@ async def main(
 
     # ------------ PIPELINE SETUP ------------
 
+    
+    # Initialize user idle processor
+    user_idle_processor = UserIdleProcessor(
+        callback=handle_user_idle,
+        timeout=10.0  #10 seconds of inactivity
+    )
+    
     # Build pipeline
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
+            user_idle_processor,  # User idle processor
             context_aggregator.user(),  # User responses
             llm,  # LLM
             tts,  # TTS
@@ -156,19 +268,38 @@ async def main(
 
     # ------------ EVENT HANDLERS ------------
 
+    
     @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(transport, participant):
-        logger.debug(f"First participant joined: {participant['id']}")
-        await transport.capture_participant_transcription(participant["id"])
+    async def on_first_participant_joined(transport_instance, participant):
+        nonlocal call_id_for_logs # To potentially update if more specific ID comes from participant
+        global _call_start_time
+        _call_start_time = datetime.datetime.now()
+        participant_id = participant.get('id', 'UnknownParticipant')
+        # Potentially refine call_id_for_logs if participant data is more specific
+        # e.g., if call_id_for_logs was "N/A" and participant has a session_id that's better
+        logger.info(f"First participant {participant_id} joined. Call timer started at: {_call_start_time.isoformat()}. Logging with ID: {call_id_for_logs}")
+        await transport_instance.capture_participant_transcription(participant["id"])
+        # Send initial greeting or context
+        task.queue_frame(TTSSpeakFrame("Hello, welcome! How can I help you today?"))
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
+    # User leaves
     @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport, participant, reason):
-        logger.debug(f"Participant left: {participant}, reason: {reason}")
-        await task.cancel()
+    async def on_participant_left(transport_instance, participant, reason):
+        global _active_pipeline_task
+        participant_id = participant.get('user_name', participant.get('id', 'UnknownParticipant'))
+        logger.debug(f"Participant {participant_id} left. Reason: {reason}")
+        log_call_summary(f"Participant {participant_id} left: {reason}", call_id_for_logs)
+        if _active_pipeline_task:
+            await _active_pipeline_task.cancel()
 
+    # Bot leaves
+    @transport.event_handler("on_left") 
+    async def on_left_handler(transport_instance, event_data=None):
+        logger.info(f"Bot has left the Daily room. Event data: {event_data}")
+        log_call_summary("Bot left room (pipeline ended or cancelled)", call_id_for_logs)
+    
     # ------------ RUN PIPELINE ------------
-
     if test_mode:
         logger.debug("Running in test mode (can be tested in Daily Prebuilt)")
 

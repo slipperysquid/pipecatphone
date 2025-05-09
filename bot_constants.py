@@ -14,7 +14,7 @@ REQUIRED_ENV_VARS = [
 ]
 
 # Default example to use when handling dialin webhooks - determines which bot type to run
-DEFAULT_DIALIN_EXAMPLE = "call_transfer"  # Options: call_transfer, simple_dialin
+DEFAULT_DIALIN_EXAMPLE = "simple_dialin"  # Options: call_transfer, simple_dialin
 
 # Call transfer configuration constants
 DEFAULT_CALLTRANSFER_MODE = "dialout"
